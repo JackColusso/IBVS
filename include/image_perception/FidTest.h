@@ -12,6 +12,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
+#include "image_perception/TriggerTest.h"
 
 
 // Include the fiducial marker tracking library's header file
@@ -23,11 +24,14 @@ public:
     FiducialPerception(ros::NodeHandle* n);
     void imageCallback(const sensor_msgs::Image::ConstPtr& msg);
     void loadRefImage();
+    bool triggerTest(image_perception::TriggerTest::Request &req, 
+                     image_perception::TriggerTest::Response &res);
 
 private:
     ros::Subscriber _sub_image;
     ros::Publisher _pub_twist;
     ros::Publisher _marker_pub;
+    ros::ServiceServer _service;
 
     cv::Ptr<cv::aruco::Dictionary> _markerDictionary;
     cv::Mat _cameraMatrix;
@@ -76,6 +80,8 @@ private:
     void publishMarkerTransforms(const std::vector<int>& markerIds, const std::vector<cv::Vec3d>& rvecs, const std::vector<cv::Vec3d>& tvecs);
     void publishMarker(const cv::Point2f center, int marker_id);
     geometry_msgs::TwistStamped smoothTwistCommand(geometry_msgs::TwistStamped current_command);
+    void computeTwistCommandForTest();
+    cv::Mat computePseudoInverse(const cv::Mat& matrix, double lambda);
     
 };
 

@@ -1,0 +1,5 @@
+# TriggerTest.srv
+bool trigger  # request to trigger the test
+---
+bool success  # response indicating success of the operation
+string message  # response message detailing the operation result

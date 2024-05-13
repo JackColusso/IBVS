@@ -10,10 +10,13 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
 
+
 FiducialPerception::FiducialPerception(ros::NodeHandle* n) : tfListener(std::make_unique<tf2_ros::TransformListener>(tfBuffer)){
     _sub_image = n->subscribe("usb_cam/image_raw", 1, &FiducialPerception::imageCallback, this);
     _pub_twist = n->advertise<geometry_msgs::TwistStamped>("twist_camera", 10);
     _marker_pub = n->advertise<visualization_msgs::MarkerArray>("visualization_marker_array", 10);
+
+    _service = n->advertiseService("trigger_test", &FiducialPerception::triggerTest, this);
 
     _markerDictionary = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
 
@@ -24,6 +27,86 @@ FiducialPerception::FiducialPerception(ros::NodeHandle* n) : tfListener(std::mak
     _cameraMatrix = cv::Mat(3, 3, CV_64F, cameraMatrixData.data());
     _distCoeffs = cv::Mat(1, 5, CV_64F, distortionCoeffsData.data());
 
+}
+
+bool FiducialPerception::triggerTest(image_perception::TriggerTest::Request &req, image_perception::TriggerTest::Response &res) {
+    if (req.trigger) {
+        computeTwistCommandForTest();
+        res.success = true;
+        res.message = "Test triggered successfully!";
+    } else {
+        res.success = false;
+        res.message = "Test not triggered.";
+    }
+    return true;
+}
+
+void FiducialPerception::computeTwistCommandForTest() {
+
+    // Example target positions in the image
+    cv::Point2f targetPosition10 = cv::Point2f(0, 0);
+    cv::Point2f targetPosition20 = cv::Point2f(0, 0);
+    cv::Point2f targetPosition30 = cv::Point2f(0, 0);
+
+    // Calculate the uv distances manually
+    cv::Point2f uvDistance10 = targetPosition10 - referenceCenter10;
+    cv::Point2f uvDistance20 = targetPosition20 - referenceCenter20;
+    cv::Point2f uvDistance30 = targetPosition30 - referenceCenter30;
+
+    // Manually fill the Jacobian matrix using these distances
+    cv::Mat jacobianMatrix = cv::Mat::zeros(6, 6, CV_64F);
+    fillJacobianRow(jacobianMatrix, targetPosition10, 0, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), -10);
+    fillJacobianRow(jacobianMatrix, targetPosition20, 2, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), -10);
+    fillJacobianRow(jacobianMatrix, targetPosition30, 4, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), -10);
+
+    // Compute twist using this simplified model
+    geometry_msgs::TwistStamped twist_command_msg;
+
+
+    // Scaling factor (lambda)
+    const double lambda = 0.0025; // This is a parameter you might need to tune
+    // Convert differences to velocities
+    cv::Mat velocity = (cv::Mat_<double>(6, 1) << uvDistance10.x, uvDistance10.y,
+                                                    uvDistance20.x, uvDistance20.y,
+                                                    uvDistance30.x, uvDistance30.y);
+    
+
+
+    // Scale the error by lambda
+    cv::Mat scaled_error = lambda * velocity;
+
+    // METHOD 3: JACOBIAN MANIPULATION
+    double lambdaa = 0.2; // Small regularization factor
+    cv::Mat identity = cv::Mat::eye(jacobianMatrix.rows, jacobianMatrix.cols, CV_64F);
+    cv::Mat regularizedJacobian = jacobianMatrix + lambdaa * identity;
+    cv::Mat jacobianInverse = regularizedJacobian.inv(cv::DECOMP_SVD);
+
+    // Calculate the camera velocity (twist) using the inverse Jacobian
+    cv::Mat twist_velocity = jacobianInverse * scaled_error;
+
+    // Log the scaled error and the twist velocity for debugging
+    std::cout << "Scaled Error:" << std::endl << scaled_error << std::endl;
+    std::cout << "Twist Velocity:" << std::endl << twist_velocity << std::endl;
+    std::cout << "Jacobian Inverse: " << std::endl << jacobianInverse << std::endl;
+
+    // Convert the twist velocity to your desired message format
+    
+    twist_command_msg.header.stamp = ros::Time::now(); // Set the current time
+    twist_command_msg.header.frame_id = "tool0"; // Or whatever frame you're working in
+
+    // Assuming you want to control linear velocity in Z and angular velocity in X and Y
+    twist_command_msg.twist.linear.x = twist_velocity.at<double>(0);
+    twist_command_msg.twist.linear.y = twist_velocity.at<double>(1);
+    twist_command_msg.twist.linear.z = twist_velocity.at<double>(2);
+    twist_command_msg.twist.angular.x = twist_velocity.at<double>(3);
+    twist_command_msg.twist.angular.y = twist_velocity.at<double>(4);
+    twist_command_msg.twist.angular.z = twist_velocity.at<double>(5);
+
+    // Publish or log the twist command
+    std::cout << "Computed Twist: [" << twist_command_msg.twist.linear.x << ", " << twist_command_msg.twist.linear.y << ", " << twist_command_msg.twist.linear.z << "]" << std::endl;
+
+    _pub_twist.publish(twist_command_msg);
+    sleep(5);
 }
 
 void FiducialPerception::imageCallback(const sensor_msgs::Image::ConstPtr& msg) {
@@ -199,6 +282,25 @@ void FiducialPerception::publishMarkerTransforms(const std::vector<int>& markerI
     }
 }
 
+cv::Mat FiducialPerception::computePseudoInverse(const cv::Mat& matrix, double lambda) {
+    cv::Mat u, w, vt;
+    cv::SVDecomp(matrix, w, u, vt);
+
+    // Apply regularization to singular values
+    cv::Mat regularizedW = cv::Mat::zeros(w.rows, w.rows, w.type());
+    for (int i = 0; i < w.rows; ++i) {
+        if (std::abs(w.at<double>(i)) > 1e-6) {  // Avoid division by zero
+            regularizedW.at<double>(i, i) = w.at<double>(i) / (w.at<double>(i) * w.at<double>(i) + lambda * lambda);
+        }
+    }
+
+    // Compute the pseudo-inverse
+    cv::Mat pseudoInverse = vt.t() * regularizedW.t() * u.t();
+
+    return pseudoInverse;
+}
+
+
 void FiducialPerception::visualizeAdjustments(cv::Mat& image) {
     // Create a blank canvas (black background)
     cv::Mat canvas = cv::Mat::zeros(500, 750, CV_8UC3); // Adjust size as needed
@@ -206,20 +308,27 @@ void FiducialPerception::visualizeAdjustments(cv::Mat& image) {
     uvDistance20 = cv::Point2f(0.0f, 0.0f);
     uvDistance30 = cv::Point2f(0.0f, 0.0f);
 
+    //FOR TEST ONLY - LEAVE COMMENTED OUT
+    // receivedCenter10 = cv::Point2f(490, 160);
+    // receivedCenter20 = cv::Point2f(450, 208);
+    // receivedCenter30 = cv::Point2f(528, 216);
+
+    cv::circle(canvas, cv::Point2f(0.0f, 0.0f), 4, cv::Scalar(255, 0, 0), -1);
+
     // Check if markers have been detected
     if(receivedCenter10 != cv::Point2f(-1.0f, -1.0f)){
-        uvDistance10 = receivedCenter10 - referenceCenter10;
+        uvDistance10 = referenceCenter10 - receivedCenter10;
         // Draw arrows from received centers to reference centers
         cv::arrowedLine(canvas, receivedCenter10, referenceCenter10, cv::Scalar(255, 0, 0), 2);
         cv::circle(canvas, referenceCenter10, 4, cv::Scalar(255, 0, 0), -1); 
     }
     if(receivedCenter20 != cv::Point2f(-1.0f, -1.0f)){
-        uvDistance20 = receivedCenter20 - referenceCenter20;
+        uvDistance20 = referenceCenter20 - receivedCenter20;
         cv::arrowedLine(canvas, receivedCenter20, referenceCenter20, cv::Scalar(0, 255, 0), 2);
         cv::circle(canvas, referenceCenter20, 4, cv::Scalar(255, 0, 0), -1); 
     }
     if(receivedCenter30 != cv::Point2f(-1.0f, -1.0f)){
-        uvDistance30 = receivedCenter30 - referenceCenter30;
+        uvDistance30 = referenceCenter30 - receivedCenter30;
         cv::arrowedLine(canvas, receivedCenter30, referenceCenter30, cv::Scalar(0, 0, 255), 2);
         cv::circle(canvas, referenceCenter30, 4, cv::Scalar(255, 0, 0), -1); 
     }
@@ -252,9 +361,13 @@ void FiducialPerception::fillJacobianRow(cv::Mat& jacobianMatrix, const cv::Poin
     jacobianMatrix.at<double>(rowIndex + 1, 0) = 0;
     jacobianMatrix.at<double>(rowIndex + 1, 1) = -fy / Z;
     jacobianMatrix.at<double>(rowIndex + 1, 2) = (v - cy) / Z;
-    jacobianMatrix.at<double>(rowIndex + 1, 3) = fy * fy + (v - cy) * (v - cy) / fy;
+    jacobianMatrix.at<double>(rowIndex + 1, 3) = (fy * fy + (v - cy) * (v - cy)) / fy;
     jacobianMatrix.at<double>(rowIndex + 1, 4) = -(u - cx) * (v - cy) / fy;
     jacobianMatrix.at<double>(rowIndex + 1, 5) = -(u - cx);
+
+    // std::cout << "Original (u, v): (" << u << ", " << v << ")" << std::endl;
+    // std::cout << "Corrected (u, v): (" << u_cor << ", " << v_cor << ")" << std::endl;
+
 }
 
 
@@ -263,21 +376,33 @@ geometry_msgs::TwistStamped FiducialPerception::computeTwistCommand() {
     geometry_msgs::TwistStamped twist_command_msg;
     // Example Jacobian matrix for one marker, adjust as needed for multiple markers
     cv::Mat jacobianMatrix = cv::Mat::zeros(6, 6, CV_64F);
-    // std::cout << receivedCenter10 << std::endl;
-    // std::cout << receivedCenter20 << std::endl;
-    // std::cout << receivedCenter30 << std::endl;
+    std::cout << receivedCenter10 << std::endl;
+    std::cout << receivedCenter20 << std::endl;
+    std::cout << receivedCenter30 << std::endl;
 
-    fillJacobianRow(jacobianMatrix, receivedCenter10, 0, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), -10); 
-    fillJacobianRow(jacobianMatrix, receivedCenter20, 2, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), -10); 
-    fillJacobianRow(jacobianMatrix, receivedCenter30, 4, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), -10); 
+    // Set the Z parameter
+    int Z = 2;
+
+    // Leaved Commented out - For debugging ONLY
+    // receivedCenter10 = cv::Point2f(490, 160);
+    // receivedCenter20 = cv::Point2f(450, 208);
+    // receivedCenter30 = cv::Point2f(528, 216);
+
+
+    fillJacobianRow(jacobianMatrix, receivedCenter10, 0, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), Z); 
+    fillJacobianRow(jacobianMatrix, receivedCenter20, 2, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), Z); 
+    fillJacobianRow(jacobianMatrix, receivedCenter30, 4, _cameraMatrix.at<double>(0, 0), _cameraMatrix.at<double>(1, 1), _cameraMatrix.at<double>(0, 2), _cameraMatrix.at<double>(1, 2), Z); 
 
     // Scaling factor (lambda)
-    const double lambda = 0.005; // This is a parameter you might need to tune
-
+    const double lambda = 0.5; // This is a parameter you might need to tune
+    // const double lambda2 = 1;
     // Convert differences to velocities
     cv::Mat velocity = (cv::Mat_<double>(6, 1) << uvDistance10.x, uvDistance10.y,
                                                     uvDistance20.x, uvDistance20.y,
                                                     uvDistance30.x, uvDistance30.y);
+
+    // From MATLAB Testing - No logical explaination
+    velocity = velocity * 0.5;
     
 
 
@@ -293,10 +418,15 @@ geometry_msgs::TwistStamped FiducialPerception::computeTwistCommand() {
     // cv::Mat jacobianInverse = jacobianMatrix.inv(cv::DECOMP_SVD);
 
     // METHOD 3: JACOBIAN MANIPULATION
-    double lambdaa = 0.1; // Small regularization factor
-    cv::Mat identity = cv::Mat::eye(jacobianMatrix.rows, jacobianMatrix.cols, CV_64F);
-    cv::Mat regularizedJacobian = jacobianMatrix + lambdaa * identity;
-    cv::Mat jacobianInverse = regularizedJacobian.inv(cv::DECOMP_SVD);
+    // double lambdaa = 0.1; // Small regularization factor
+    // cv::Mat identity = cv::Mat::eye(jacobianMatrix.rows, jacobianMatrix.cols, CV_64F);
+    // cv::Mat regularizedJacobian = jacobianMatrix + lambdaa * identity;
+    // cv::Mat jacobianInverse = regularizedJacobian.inv(cv::DECOMP_SVD);
+
+    // METHOD 4
+    // Compute pseudo-inverse
+    double lambdaa = 0.1;
+    cv::Mat jacobianInverse = computePseudoInverse(jacobianMatrix, lambdaa);
 
     // Calculate the camera velocity (twist) using the inverse Jacobian
     cv::Mat twist_velocity = jacobianInverse * scaled_error;
@@ -310,9 +440,10 @@ geometry_msgs::TwistStamped FiducialPerception::computeTwistCommand() {
     // cv::Mat twist_velocity = dampedJacobian * scaled_error;
 
     // Log the scaled error and the twist velocity for debugging
-    // std::cout << "Scaled Error:" << std::endl << scaled_error << std::endl;
-    // std::cout << "Twist Velocity:" << std::endl << twist_velocity << std::endl;
-    // std::cout << "Jacobian Inverse: " << std::endl << jacobianInverse << std::endl;
+    std::cout << "Jacobian Matrix:" << std::endl << jacobianMatrix << std::endl;
+    std::cout << "Scaled Error:" << std::endl << velocity << std::endl;
+    std::cout << "Twist Velocity:" << std::endl << twist_velocity << std::endl;
+    std::cout << "Jacobian Inverse: " << std::endl << jacobianInverse << std::endl;
 
     // Convert the twist velocity to your desired message format
     
